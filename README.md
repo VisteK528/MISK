@@ -14,3 +14,5 @@ pip3 install -r requirements.txt
 ```bash
 pre-commit install
 ```
+
+Now pre-commit hooks will run before every commit. You can also run them manually using command `pre-commit run --files <file>` or `pre-commit run --all-files`
