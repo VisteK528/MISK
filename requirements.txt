@@ -1,0 +1,4 @@
+pre-commit
+networkx
+simpy
+numpy
