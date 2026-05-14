@@ -5,6 +5,13 @@ from enum import Enum
 from typing import Optional
 
 
+@dataclass
+class Waypoint:
+    city: str
+    order_id: int
+    action: str  # "pickup" | "delivery"
+
+
 class VehicleStatus(Enum):
     IDLE = "idle"
     MOVING = "moving"
@@ -29,6 +36,7 @@ class Order:
     deadline: float  # sim-time when due
     penalty_rate: float  # EUR per hour late
     created_at: float
+    revenue: float = 0.0
     status: OrderStatus = OrderStatus.PENDING
     assigned_vehicle: Optional[int] = None
     delivered_at: Optional[float] = None
@@ -60,8 +68,9 @@ class Vehicle:
     route: list[str] = field(default_factory=list)
     route_index: int = 0
     progress: float = 0.0  # 0-1 along current segment
-    pickup_city: str = ""
-    delivery_city: str = ""
+
+    waypoints: list[Waypoint] = field(default_factory=list)
+    waypoint_index: int = 0
 
     order_ids: list[int] = field(default_factory=list)
     current_load: float = 0.0

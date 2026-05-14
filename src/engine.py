@@ -12,6 +12,7 @@ from models import (
     OrderStatus,
     Vehicle,
     VehicleStatus,
+    Waypoint,
 )
 
 
@@ -36,7 +37,6 @@ class SimulationEngine:
         if config.scenario_logistics_center:
             self._init_logistics_center()
 
-        # Start SimPy processes
         self.env.process(self._order_generator())
         if config.scenario_breakdowns:
             self.env.process(self._breakdown_process())
@@ -47,6 +47,10 @@ class SimulationEngine:
     @property
     def time(self) -> float:
         return self.env.now
+
+    # ------------------------------------------------------------------
+    # Initialisation
+    # ------------------------------------------------------------------
 
     def _init_vehicles(self):
         for i in range(self.config.num_vehicles):
@@ -66,15 +70,22 @@ class SimulationEngine:
         # TODO implement logistics center
         pass
 
+    # ------------------------------------------------------------------
+    # Simulation control
+    # ------------------------------------------------------------------
+
     def step(self, dt: float):
-        """Advance simulation by *dt* hours"""
+        """Advance simulation by *dt* hours."""
         target = self.env.now + dt
         if target > self.config.simulation_duration:
             target = self.config.simulation_duration
         self.env.run(until=target)
 
+    # ------------------------------------------------------------------
+    # Order generation
+    # ------------------------------------------------------------------
+
     def _order_generator(self):
-        """Poisson-like order arrivals."""
         while True:
             interval = self.rng.expovariate(1.0 / self.config.order_interval_mean)
             yield self.env.timeout(interval)
@@ -92,6 +103,11 @@ class SimulationEngine:
         deadline = self.env.now + self.rng.uniform(
             self.config.order_deadline_min, self.config.order_deadline_max
         )
+
+        _, delivery_h = self.graph.dijkstra(src, dst, self.config.vehicle_speed)
+        delivery_km = delivery_h * self.config.vehicle_speed
+        revenue = self.config.base_revenue + self.config.revenue_per_km * delivery_km
+
         order = Order(
             id=self._order_counter,
             source=src,
@@ -100,19 +116,23 @@ class SimulationEngine:
             deadline=deadline,
             penalty_rate=self.config.penalty_per_hour,
             created_at=self.env.now,
+            revenue=revenue,
         )
         self.orders.append(order)
         self._order_counter += 1
         self.log(
-            f"Order #{order.id}: {src} → {dst}  "
-            f"{weight:.0f} kg, due in {deadline - self.env.now:.0f}h"
+            f"Order #{order.id}: {src}→{dst}  "
+            f"{weight:.0f} kg, due in {deadline - self.env.now:.0f}h, "
+            f"revenue €{revenue:.0f}"
         )
 
+    # ------------------------------------------------------------------
+    # Dispatcher
+    # ------------------------------------------------------------------
+
     def _dispatcher(self):
-        """Periodically assign pending orders to available vehicles."""
         while True:
-            # TODO Replace current dispatcher algorithm with profits-costs optimizing one
-            yield self.env.timeout(0.5)  # check every 0.5 sim-hours
+            yield self.env.timeout(0.5)
             if self.env.now >= self.config.simulation_duration:
                 return
             self._assign_pending_orders()
@@ -120,78 +140,194 @@ class SimulationEngine:
                 self._process_hub_orders()
 
     def _assign_pending_orders(self):
+        """
+        Profit-maximising dispatcher using cheapest insertion.
+
+        For each idle vehicle, greedily pack orders as long as the marginal
+        profit of adding the next order is positive.  All candidates are
+        scored simultaneously so the globally best (vehicle, order) pair is
+        always chosen first.
+        """
         pending = [o for o in self.orders if o.status == OrderStatus.PENDING]
         if not pending:
             return
-        available = [
+
+        idle_vehicles = [
             v
             for v in self.vehicles
             if v.status == VehicleStatus.IDLE and not v.order_ids
         ]
-        for v in available:
+
+        for v in idle_vehicles:
             if not pending:
                 break
-            best_order = None
-            best_score = float("inf")
-            for order in pending:
-                if v.current_load + order.weight > v.capacity:
-                    continue
-                path, pickup_time = self.graph.dijkstra(
-                    v.current_city, order.source, v.speed
-                )
-                if not path:
-                    continue
-                _, delivery_time = self.graph.dijkstra(
-                    order.source, order.destination, v.speed
-                )
-                total = pickup_time + delivery_time
-                time_left = order.deadline - self.env.now
-                urgency = max(0.0, total - time_left)
-                score = pickup_time * 2.0 + urgency * 0.5
-                if score < best_score:
-                    best_score = score
-                    best_order = order
-            if best_order is not None:
+            # Keep adding orders to this vehicle while it's profitable
+            while pending:
+                best_profit = 0.0  # only accept positive-profit additions
+                best_order: Order | None = None
+                best_wps: list[Waypoint] = []
+
+                for order in pending:
+                    profit, new_wps = self._cheapest_insertion(v, order)
+                    if profit > best_profit:
+                        best_profit = profit
+                        best_order = order
+                        best_wps = new_wps
+
+                if best_order is None:
+                    break  # nothing profitable to add
+
                 pending.remove(best_order)
-                self._dispatch_vehicle(v, best_order)
+                best_order.status = OrderStatus.ASSIGNED
+                best_order.assigned_vehicle = v.id
+                v.order_ids.append(best_order.id)
+                v.current_load += best_order.weight
+                v.waypoints = best_wps
+                self.log(
+                    f"Queued order #{best_order.id} "
+                    f"({best_order.source}→{best_order.destination}) "
+                    f"for vehicle {v.id}  profit €{best_profit:.0f}"
+                )
 
-    def _dispatch_vehicle(self, vehicle: Vehicle, order: Order):
-        """Assign an order and start the vehicle SimPy process."""
-        order.status = OrderStatus.ASSIGNED
-        order.assigned_vehicle = vehicle.id
-        vehicle.order_ids.append(order.id)
-        vehicle.current_load += order.weight
+            if v.order_ids:
+                self._launch_vehicle(v)
 
-        # Build route: current_city -> source -> destination
-        if vehicle.current_city == order.source:
-            p2, _ = self.graph.dijkstra(order.source, order.destination, vehicle.speed)
-            path_full = p2
-        else:
-            p1, _ = self.graph.dijkstra(
-                vehicle.current_city, order.source, vehicle.speed
-            )
-            p2, _ = self.graph.dijkstra(order.source, order.destination, vehicle.speed)
-            path_full = p1 + p2[1:]
+    # ------------------------------------------------------------------
+    # Route helpers
+    # ------------------------------------------------------------------
 
-        vehicle.route = path_full
-        vehicle.route_index = 0
-        vehicle.progress = 0.0
-        vehicle.pickup_city = order.source
-        vehicle.delivery_city = order.destination
-        vehicle.status = VehicleStatus.MOVING
-        self.log(
-            f"Vehicle {vehicle.id} → order #{order.id} "
-            f"({order.source} → {order.destination})"
-        )
-        # Launch vehicle process
-        self.env.process(self._vehicle_process(vehicle))
+    def _path_km(self, path: list[str]) -> float:
+        """Total road distance in km for a city path."""
+        km = 0.0
+        for i in range(len(path) - 1):
+            d = self.graph.get_distance(path[i], path[i + 1])
+            km += d or 0.0
+        return km
+
+    def _build_route(self, waypoints: list[Waypoint], start_city: str) -> list[str]:
+        """
+        Concatenate Dijkstra shortest-paths between consecutive waypoints.
+        Returns an empty list if any segment has no valid path.
+        """
+        route: list[str] = [start_city]
+        current = start_city
+        for wp in waypoints:
+            if wp.city == current:
+                continue
+            seg, _ = self.graph.dijkstra(current, wp.city, self.config.vehicle_speed)
+            if not seg:
+                return []
+            route.extend(seg[1:])
+            current = wp.city
+        return route
+
+    def _delivery_eta(
+        self,
+        start_city: str,
+        waypoints: list[Waypoint],
+        order_id: int,
+        speed: float,
+    ) -> float:
+        """Estimated arrival time at delivery waypoint for a given order."""
+        current = start_city
+        t = self.env.now
+        for wp in waypoints:
+            if wp.city != current:
+                _, seg_h = self.graph.dijkstra(current, wp.city, speed)
+                t += seg_h
+                current = wp.city
+            if wp.action == "delivery" and wp.order_id == order_id:
+                return t
+        return float("inf")
+
+    def _cheapest_insertion(
+        self, v: Vehicle, order: Order
+    ) -> tuple[float, list[Waypoint]]:
+        """
+        Find the insertion position for (pickup, delivery) in v's current
+        waypoints list that maximises profit.
+
+        profit = order.revenue - extra_fuel_cost - expected_penalty
+
+        Returns (best_profit, new_waypoints).  Returns (-inf, []) if the
+        order cannot be added (capacity exceeded, no valid path).
+        """
+        if v.current_load + order.weight > v.capacity:
+            return float("-inf"), []
+
+        wps = list(v.waypoints)
+        n = len(wps)
+
+        current_route = self._build_route(wps, v.current_city)
+        current_km = self._path_km(current_route)
+
+        best_profit = float("-inf")
+        best_wps: list[Waypoint] = []
+
+        pickup_wp = Waypoint(order.source, order.id, "pickup")
+        delivery_wp = Waypoint(order.destination, order.id, "delivery")
+
+        for i in range(n + 1):  # insertion index for pickup
+            for j in range(i, n + 1):  # insertion index for delivery (>= pickup)
+                candidate = wps[:i] + [pickup_wp] + wps[i:j] + [delivery_wp] + wps[j:]
+                new_route = self._build_route(candidate, v.current_city)
+                if not new_route:
+                    continue
+
+                extra_km = self._path_km(new_route) - current_km
+                fuel_cost = extra_km * v.fuel_cost_per_km
+
+                delivery_eta = self._delivery_eta(
+                    v.current_city, candidate, order.id, v.speed
+                )
+                penalty_risk = (
+                    max(0.0, delivery_eta - order.deadline) * order.penalty_rate
+                )
+
+                profit = order.revenue - fuel_cost - penalty_risk
+
+                if profit > best_profit:
+                    best_profit = profit
+                    best_wps = candidate
+
+        return best_profit, best_wps
+
+    # ------------------------------------------------------------------
+    # Vehicle launch
+    # ------------------------------------------------------------------
+
+    def _launch_vehicle(self, v: Vehicle):
+        """Build final route from waypoints and start the SimPy process."""
+        route = self._build_route(v.waypoints, v.current_city)
+        if not route:
+            self.log(f"Vehicle {v.id}: could not build route, staying idle")
+            v.order_ids.clear()
+            v.waypoints.clear()
+            v.current_load = 0.0
+            return
+
+        v.route = route
+        v.route_index = 0
+        v.progress = 0.0
+        v.waypoint_index = 0
+        v.status = VehicleStatus.MOVING
+        cities = " → ".join(wp.city for wp in v.waypoints[:6])
+        self.log(f"Vehicle {v.id} departing: {cities}")
+        self.env.process(self._vehicle_process(v))
+
+    # ------------------------------------------------------------------
+    # Vehicle process
+    # ------------------------------------------------------------------
 
     def _vehicle_process(self, v: Vehicle):
-        """Drive a vehicle through its route segment by segment."""
+        """Drive a vehicle through its multi-stop route segment by segment."""
+        # Handle pickups/deliveries at the starting city
+        self._process_waypoints_at(v, v.current_city)
+
         while v.route_index < len(v.route) - 1:
             if v.status == VehicleStatus.BROKEN_DOWN:
                 pass
-                # TODO implement broken down behaviour
+                # TODO implement broken-down behaviour (Scenario 2)
 
             ca = v.route[v.route_index]
             cb = v.route[v.route_index + 1]
@@ -209,7 +345,6 @@ class SimulationEngine:
             eff_speed = v.speed / mult
             seg_time = dist / eff_speed
 
-            # Animate the segment in small increments for UI smoothness
             steps = max(1, int(seg_time / 0.1))
             step_dt = seg_time / steps
             v.progress = 0.0
@@ -222,26 +357,18 @@ class SimulationEngine:
                 v.total_distance_km += km_step
                 v.total_fuel_cost += km_step * v.fuel_cost_per_km
 
-                # Break out if broken down mid-segment
                 if v.status == VehicleStatus.BROKEN_DOWN:
                     break
 
             if v.status == VehicleStatus.BROKEN_DOWN:
-                continue  # loop back to wait for repair
+                continue
 
-            # Arrived at next city
             v.route_index += 1
             v.progress = 0.0
             v.current_city = cb
 
-            # Check if arrived at pickup city
-            if cb == v.pickup_city:
-                for oid in v.order_ids:
-                    o = self.orders[oid]
-                    if o.status == OrderStatus.ASSIGNED:
-                        o.status = OrderStatus.IN_TRANSIT
+            self._process_waypoints_at(v, cb)
 
-            # Driver rest check (skip if double crew)
             if (
                 not self.config.double_crew
                 and v.hours_worked >= v.max_work_hours
@@ -256,45 +383,92 @@ class SimulationEngine:
 
         self._handle_arrival(v)
 
+    def _process_waypoints_at(self, v: Vehicle, city: str):
+        """Execute all pending waypoints whose city matches the current city."""
+        while (
+            v.waypoint_index < len(v.waypoints)
+            and v.waypoints[v.waypoint_index].city == city
+        ):
+            wp = v.waypoints[v.waypoint_index]
+            order = self.orders[wp.order_id]
+
+            if wp.action == "pickup":
+                if order.status == OrderStatus.ASSIGNED:
+                    order.status = OrderStatus.IN_TRANSIT
+                    self.log(f"Vehicle {v.id} picked up #{order.id} at {city}")
+
+            else:  # delivery
+                if order.status in (OrderStatus.IN_TRANSIT, OrderStatus.ASSIGNED):
+                    order.status = OrderStatus.DELIVERED
+                    order.delivered_at = self.env.now
+                    v.deliveries += 1
+                    v.current_load = max(0.0, v.current_load - order.weight)
+                    if order.id in v.order_ids:
+                        v.order_ids.remove(order.id)
+                    result = (
+                        f"LATE {order.delay:.1f}h  -€{order.penalty:.0f}"
+                        if order.delay > 0
+                        else f"+€{order.revenue:.0f}"
+                    )
+                    self.log(
+                        f"Vehicle {v.id} delivered #{order.id} at {city}  {result}"
+                    )
+
+            v.waypoint_index += 1
+
     def _handle_arrival(self, v: Vehicle):
-        """Vehicle reached end of its route."""
-        delivered_ids = list(v.order_ids)
-        for oid in delivered_ids:
+        """Clean up after a vehicle completes its full route."""
+        # Deliver any orders that somehow weren't delivered mid-route
+        for oid in list(v.order_ids):
             o = self.orders[oid]
             if o.status in (OrderStatus.IN_TRANSIT, OrderStatus.ASSIGNED):
                 o.status = OrderStatus.DELIVERED
                 o.delivered_at = self.env.now
                 v.deliveries += 1
                 delay_str = (
-                    f" (LATE {o.delay:.1f}h, €{o.penalty:.0f})" if o.delay > 0 else ""
+                    f" LATE {o.delay:.1f}h  -€{o.penalty:.0f}"
+                    if o.delay > 0
+                    else f"  +€{o.revenue:.0f}"
                 )
                 self.log(
                     f"Vehicle {v.id} delivered #{o.id} at {v.current_city}{delay_str}"
                 )
+
         v.order_ids.clear()
         v.current_load = 0.0
         v.route.clear()
         v.route_index = 0
         v.progress = 0.0
-        v.pickup_city = ""
-        v.delivery_city = ""
+        v.waypoints.clear()
+        v.waypoint_index = 0
         v.status = VehicleStatus.IDLE
 
+    # ------------------------------------------------------------------
+    # Rerouting (blocked roads)
+    # ------------------------------------------------------------------
+
     def _reroute_vehicle(self, v: Vehicle) -> bool:
-        """Attempt to reroute around a blocked road. Returns True if successful."""
-        if not v.route or v.route_index >= len(v.route) - 1:
+        """Rebuild route from current city through remaining waypoints."""
+        remaining = v.waypoints[v.waypoint_index :]
+        if not remaining:
+            v.status = VehicleStatus.IDLE
             return False
-        dest = v.route[-1]
-        new_path, t = self.graph.dijkstra(v.current_city, dest, v.speed)
-        if new_path and t < float("inf"):
-            v.route = new_path
+
+        new_route = self._build_route(remaining, v.current_city)
+        if new_route:
+            v.route = new_route
             v.route_index = 0
             v.progress = 0.0
-            self.log(f"Vehicle {v.id} rerouted via {' → '.join(new_path[:4])}…")
+            self.log(f"Vehicle {v.id} rerouted via {' → '.join(new_route[:4])}…")
             return True
-        self.log(f"Vehicle {v.id} stuck – no route to {dest}")
+
+        self.log(f"Vehicle {v.id} stuck – no route to {remaining[0].city}")
         v.status = VehicleStatus.IDLE
         return False
+
+    # ------------------------------------------------------------------
+    # Scenarios
+    # ------------------------------------------------------------------
 
     def _breakdown_process(self):
         """Wait until trigger time, then break down K vehicles."""
@@ -303,7 +477,7 @@ class SimulationEngine:
             return
         self._breakdowns_triggered = True
 
-        # TODO add breakdowns
+        # TODO add breakdowns (Scenario 2)
 
     def _road_event_generator(self):
         """Periodically create random road events."""
@@ -312,7 +486,15 @@ class SimulationEngine:
             if self.env.now >= self.config.simulation_duration:
                 return
 
-            # TODO implement road event generator
+            # TODO implement road event generator (Scenario 4)
+
+    def _process_hub_orders(self):
+        # TODO implement logistics hub order processing (Scenario 3)
+        pass
+
+    # ------------------------------------------------------------------
+    # UI helpers
+    # ------------------------------------------------------------------
 
     def get_vehicle_position(self, v: Vehicle) -> tuple[float, float]:
         """Return interpolated (lat, lon) for a vehicle."""
@@ -336,12 +518,13 @@ class SimulationEngine:
         on_time = [o for o in delivered if o.delay == 0]
         late = [o for o in delivered if o.delay > 0]
         total_penalty = sum(o.penalty for o in delivered)
+        total_revenue = sum(o.revenue for o in delivered)
         total_fuel = sum(v.total_fuel_cost for v in self.vehicles)
         total_repair = sum(v.total_repair_cost for v in self.vehicles)
-        moving = sum(1 for v in self.vehicles if v.status == VehicleStatus.MOVING)
-        idle = sum(1 for v in self.vehicles if v.status == VehicleStatus.IDLE)
-        broken = sum(1 for v in self.vehicles if v.status == VehicleStatus.BROKEN_DOWN)
-        resting = sum(1 for v in self.vehicles if v.status == VehicleStatus.RESTING)
+        sum(1 for v in self.vehicles if v.status == VehicleStatus.MOVING)
+        sum(1 for v in self.vehicles if v.status == VehicleStatus.IDLE)
+        sum(1 for v in self.vehicles if v.status == VehicleStatus.BROKEN_DOWN)
+        sum(1 for v in self.vehicles if v.status == VehicleStatus.RESTING)
         pending = sum(1 for o in self.orders if o.status == OrderStatus.PENDING)
         return {
             "time": self.env.now,
@@ -351,14 +534,11 @@ class SimulationEngine:
             "late": len(late),
             "pending": pending,
             "total_delay_h": sum(o.delay for o in late),
+            "total_revenue": total_revenue,
             "total_penalty": total_penalty,
             "total_fuel": total_fuel,
             "total_repair": total_repair,
-            "total_cost": total_penalty + total_fuel + total_repair,
-            "vehicles_moving": moving,
-            "vehicles_idle": idle,
-            "vehicles_broken": broken,
-            "vehicles_resting": resting,
+            "net_profit": total_revenue - total_penalty - total_fuel - total_repair,
         }
 
     def log(self, msg: str):

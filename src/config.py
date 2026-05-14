@@ -19,6 +19,8 @@ class SimConfig:
     order_deadline_min: float = 24  # hours
     order_deadline_max: float = 96  # hours
     penalty_per_hour: float = 50  # EUR per hour late
+    base_revenue: float = 200.0  # EUR flat fee per order
+    revenue_per_km: float = 2.0  # EUR per km of delivery route
 
     # Simulation
     simulation_duration: float = 168
