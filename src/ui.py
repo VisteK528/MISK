@@ -1,6 +1,7 @@
 import datetime
 import json
 import random
+import textwrap
 import tkinter as tk
 from tkinter import filedialog, ttk
 
@@ -31,6 +32,7 @@ C_IDLE = "#8aadf4"
 C_RESTING = "#f5a97f"
 C_BROKEN = "#ed8796"
 C_ROAD = "#494d64"
+FG_DIM = "#4a4e6a"
 C_ROAD_SLOW = "#eed49f"
 C_ROAD_BLOCK = "#ed8796"
 C_HUB = "#eed49f"
@@ -169,19 +171,20 @@ class TransportApp:
             self._p[key] = (var, cast)
 
         def sub_entry(parent, key, label, default, cast=float):
-            row = tk.Frame(parent, bg=BG_DARK)
+            row = tk.Frame(parent, bg=BG_PANEL)
             row.pack(fill=tk.X, padx=4, pady=1)
-            tk.Label(
+            lbl = tk.Label(
                 row,
                 text="    " + label + ":",
-                bg=BG_DARK,
+                bg=BG_PANEL,
                 fg=FG_MUTED,
                 font=("Arial", 8),
                 width=36,
                 anchor="w",
-            ).pack(side=tk.LEFT, padx=(8, 0))
+            )
+            lbl.pack(side=tk.LEFT, padx=(8, 0))
             var = tk.StringVar(value=str(default))
-            tk.Entry(
+            ent = tk.Entry(
                 row,
                 textvariable=var,
                 bg=BG_SECTION,
@@ -191,8 +194,10 @@ class TransportApp:
                 bd=3,
                 width=10,
                 insertbackground=FG_TEXT,
-            ).pack(side=tk.LEFT, padx=(4, 8), pady=2)
+            )
+            ent.pack(side=tk.LEFT, padx=(4, 8), pady=2)
             self._p[key] = (var, cast)
+            return row, lbl, ent
 
         def check(parent, key, label, default):
             row = tk.Frame(parent, bg=BG_PANEL)
@@ -211,6 +216,27 @@ class TransportApp:
                 anchor="w",
             ).pack(side=tk.LEFT, fill=tk.X, padx=8, pady=4)
             self._p[key] = (var, bool)
+            return var
+
+        def bind_scenario(scenario_var, sub_widgets):
+            def toggle(*_):
+                enabled = scenario_var.get()
+                for row_w, lbl_w, ent_w in sub_widgets:
+                    if enabled:
+                        row_w.config(bg=BG_PANEL)
+                        lbl_w.config(bg=BG_PANEL, fg=FG_MUTED)
+                        ent_w.config(state=tk.NORMAL, fg=FG_TEXT)
+                    else:
+                        row_w.config(bg=BG_DARK)
+                        lbl_w.config(bg=BG_DARK, fg=FG_DIM)
+                        ent_w.config(
+                            state=tk.DISABLED,
+                            disabledbackground=BG_DARK,
+                            disabledforeground=FG_DIM,
+                        )
+
+            scenario_var.trace_add("write", toggle)
+            toggle()
 
         # ── Left: Fleet ───────────────────────────────────────────────
         section(left, "FLOTA")
@@ -281,10 +307,17 @@ class TransportApp:
         self._seed_random = tk.BooleanVar(value=False)
 
         def _toggle_seed_entry(*_):
-            self._seed_entry.config(
-                state=tk.DISABLED if self._seed_random.get() else tk.NORMAL,
-                fg=FG_MUTED if self._seed_random.get() else FG_TEXT,
-            )
+            if self._seed_random.get():
+                self._seed_entry.config(
+                    state=tk.DISABLED,
+                    disabledbackground=BG_PANEL,
+                    disabledforeground=BG_PANEL,
+                )
+            else:
+                self._seed_entry.config(
+                    state=tk.NORMAL,
+                    fg=FG_TEXT,
+                )
 
         self._seed_random.trace_add("write", _toggle_seed_entry)
         tk.Checkbutton(
@@ -361,132 +394,153 @@ class TransportApp:
         # ── Right: Scenarios ──────────────────────────────────────────
         section(right, "SCENARIUSZE")
 
-        check(
+        var_bd = check(
             right,
             "scenario_breakdowns",
             "Awarie pojazdow (Scenariusz 2)",
             c.scenario_breakdowns,
         )
-        sub_entry(right, "breakdown_k", "Liczba pojazdow do awarii", c.breakdown_k, int)
-        sub_entry(
-            right,
-            "breakdown_trigger_time",
-            "Czas wyzwolenia awarii (h)",
-            c.breakdown_trigger_time,
-            float,
-        )
-        sub_entry(
-            right,
-            "repair_driver_prob",
-            "Prawd. naprawy wlasnej (0-1)",
-            c.repair_driver_prob,
-            float,
-        )
-        sub_entry(
-            right,
-            "repair_mobile_prob",
-            "Prawd. serwisu mobilnego (0-1)",
-            c.repair_mobile_prob,
-            float,
-        )
-        sub_entry(
-            right,
-            "repair_driver_delay",
-            "Opoznienie – naprawa wlasna (h)",
-            c.repair_driver_delay,
-            float,
-        )
-        sub_entry(
-            right,
-            "mobile_service_delay",
-            "Opoznienie – serwis mobilny (h)",
-            c.mobile_service_delay,
-            float,
-        )
-        sub_entry(
-            right,
-            "mobile_service_cost",
-            "Koszt serwisu mobilnego (EUR)",
-            c.mobile_service_cost,
-            float,
-        )
-        sub_entry(
-            right,
-            "out_of_service_duration",
-            "Czas wylaczenia pojazdu (h)",
-            c.out_of_service_duration,
-            float,
-        )
-        sub_entry(
-            right,
-            "out_of_service_cost",
-            "Koszt wylaczenia pojazdu (EUR)",
-            c.out_of_service_cost,
-            float,
+        bind_scenario(
+            var_bd,
+            [
+                sub_entry(
+                    right,
+                    "breakdown_k",
+                    "Liczba pojazdow do awarii",
+                    c.breakdown_k,
+                    int,
+                ),
+                sub_entry(
+                    right,
+                    "breakdown_trigger_time",
+                    "Czas wyzwolenia awarii (h)",
+                    c.breakdown_trigger_time,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "repair_driver_prob",
+                    "Prawd. naprawy wlasnej (0-1)",
+                    c.repair_driver_prob,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "repair_mobile_prob",
+                    "Prawd. serwisu mobilnego (0-1)",
+                    c.repair_mobile_prob,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "repair_driver_delay",
+                    "Opoznienie – naprawa wlasna (h)",
+                    c.repair_driver_delay,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "mobile_service_delay",
+                    "Opoznienie – serwis mobilny (h)",
+                    c.mobile_service_delay,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "mobile_service_cost",
+                    "Koszt serwisu mobilnego (EUR)",
+                    c.mobile_service_cost,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "out_of_service_duration",
+                    "Czas wylaczenia pojazdu (h)",
+                    c.out_of_service_duration,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "out_of_service_cost",
+                    "Koszt wylaczenia pojazdu (EUR)",
+                    c.out_of_service_cost,
+                    float,
+                ),
+            ],
         )
 
-        check(
+        var_hub = check(
             right,
             "scenario_logistics_center",
             "Centrum logistyczne (Scenariusz 3)",
             c.scenario_logistics_center,
         )
-        sub_entry(right, "hub_city", "Miasto centralne (hub)", c.hub_city, str)
-        sub_entry(
-            right,
-            "hub_via_rate",
-            "Udzial zlecen przez hub (0–1)",
-            c.hub_via_rate,
-            float,
+        bind_scenario(
+            var_hub,
+            [
+                sub_entry(right, "hub_city", "Miasto centralne (hub)", c.hub_city, str),
+                sub_entry(
+                    right,
+                    "hub_via_rate",
+                    "Udzial zlecen przez hub (0–1)",
+                    c.hub_via_rate,
+                    float,
+                ),
+            ],
         )
 
-        check(
+        var_ev = check(
             right,
             "scenario_random_events",
             "Losowe utrudnienia drogowe (Scenariusz 4)",
             c.scenario_random_events,
         )
-        sub_entry(
-            right,
-            "event_interval_mean",
-            "Sredni interwal zdarzen (h)",
-            c.event_interval_mean,
-            float,
-        )
-        sub_entry(
-            right,
-            "event_weather_mult",
-            "Mnoznik spowolnienia – pogoda",
-            c.event_weather_mult,
-            float,
-        )
-        sub_entry(
-            right,
-            "event_accident_mult",
-            "Mnoznik spowolnienia – wypadek",
-            c.event_accident_mult,
-            float,
-        )
-        sub_entry(
-            right,
-            "event_weather_duration_mean",
-            "Sredni czas zdarz. pogodowego (h)",
-            c.event_weather_duration_mean,
-            float,
-        )
-        sub_entry(
-            right,
-            "event_accident_duration_mean",
-            "Sredni czas wypadku (h)",
-            c.event_accident_duration_mean,
-            float,
-        )
-        sub_entry(
-            right,
-            "event_closure_duration_mean",
-            "Sredni czas zamkniecia drogi (h)",
-            c.event_closure_duration_mean,
-            float,
+        bind_scenario(
+            var_ev,
+            [
+                sub_entry(
+                    right,
+                    "event_interval_mean",
+                    "Sredni interwal zdarzen (h)",
+                    c.event_interval_mean,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "event_weather_mult",
+                    "Mnoznik spowolnienia – pogoda",
+                    c.event_weather_mult,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "event_accident_mult",
+                    "Mnoznik spowolnienia – wypadek",
+                    c.event_accident_mult,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "event_weather_duration_mean",
+                    "Sredni czas zdarz. pogodowego (h)",
+                    c.event_weather_duration_mean,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "event_accident_duration_mean",
+                    "Sredni czas wypadku (h)",
+                    c.event_accident_duration_mean,
+                    float,
+                ),
+                sub_entry(
+                    right,
+                    "event_closure_duration_mean",
+                    "Sredni czas zamkniecia drogi (h)",
+                    c.event_closure_duration_mean,
+                    float,
+                ),
+            ],
         )
 
         # ── Run button ────────────────────────────────────────────────
@@ -837,7 +891,7 @@ class TransportApp:
             return
 
         fig = Figure(figsize=(3.8, 2.1), dpi=90, facecolor=BG_SECTION)
-        fig.subplots_adjust(left=0.05, right=0.65, top=0.93, bottom=0.22)
+        fig.subplots_adjust(left=0.1, right=0.65, top=0.93, bottom=0.22)
         ax = fig.add_subplot(111)
         ax.set_facecolor(BG_PANEL)
         ax.tick_params(colors=FG_MUTED, labelsize=6)
@@ -1315,7 +1369,8 @@ class TransportApp:
         self._log.config(state=tk.NORMAL)
         while self.engine.log_messages:
             msg = self.engine.log_messages.popleft()
-            self._log.insert(tk.END, msg + "\n", self._log_tag(msg))
+            wrapped = textwrap.fill(msg, width=55, subsequent_indent="          ")
+            self._log.insert(tk.END, wrapped + "\n", self._log_tag(msg))
         self._log.see(tk.END)
         self._log.config(state=tk.DISABLED)
 
