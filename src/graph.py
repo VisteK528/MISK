@@ -1,4 +1,7 @@
 import networkx as nx
+import math
+import heapq
+import itertools
 
 # City data - latitude and longitude
 CITIES = {
@@ -130,6 +133,72 @@ class CityGraph:
         """Return set of sorted (city_a, city_b) tuples for every edge."""
         return {tuple(sorted(e)) for e in self.G.edges()}
 
+    def A_star(self, start: str, end: str, speed: float):
+        def heuristic(u, v):
+            if not hasattr(self, 'cities') or not isinstance(u, str) or not isinstance(v, str) or u not in self.cities or v not in self.cities:
+                return 0.0
+            
+            lat1, lon1 = self.cities[u]
+            lat2, lon2 = self.cities[v]
+            
+            R = 6371.0 
+            phi1, phi2 = math.radians(lat1), math.radians(lat2)
+            dphi = math.radians(lat2 - lat1)
+            dlambda = math.radians(lon2 - lon1)
+            
+            a = math.sin(dphi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0)**2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            dist_km = R * c
+            
+            return dist_km / speed
+
+        open_set = []
+        counter = itertools.count()
+        
+        came_from = {}
+        
+        g_score = {node: float("inf") for node in self.G.nodes()}
+        g_score[start] = 0.0
+        
+        f_score = {node: float("inf") for node in self.G.nodes()}
+        f_score[start] = heuristic(start, end)
+        
+        heapq.heappush(open_set, (f_score[start], next(counter), start))
+        
+        while open_set:
+            _, _, current = heapq.heappop(open_set)
+            
+            if current == end:
+                path = []
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+                path.append(start)
+                path.reverse()
+                
+                return path, g_score[end]
+                
+            for neighbor in self.G.neighbors(current):
+                edge_data = self.G[current][neighbor]
+                
+                speed_mult = edge_data.get("speed_multiplier", 1.0)
+                if speed_mult >= 100:
+                    continue
+                
+                actual_speed = speed / speed_mult
+                weight = edge_data["distance_km"] / actual_speed
+                
+                tentative_g_score = g_score[current] + weight
+                
+                if tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score[neighbor] = tentative_g_score + heuristic(neighbor, end)
+                    
+                    heapq.heappush(open_set, (f_score[neighbor], next(counter), neighbor))
+                    
+        return [], float("inf")
+    
     def dijkstra(self, start: str, end: str, speed: float):
         try:
             path = nx.dijkstra_path(
