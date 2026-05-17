@@ -1,7 +1,7 @@
-import time
-
+import tkinter as tk
 from config import SimConfig
 from engine import SimulationEngine
+from ui import TransportApp
 
 cfg = SimConfig(
     num_vehicles=8,
@@ -17,14 +17,10 @@ cfg = SimConfig(
     scenario_random_events=False,
 )
 
-app = SimulationEngine(cfg)
+app_engine = SimulationEngine(cfg)
 
-real_time_dt = 0.01
-while True:
-    dt = app.config.time_step
-    app.step(dt)
-    for msg in app.log_messages:
-        print(msg)
-    time.sleep(real_time_dt)
-    if app.time >= app.config.simulation_duration:
-        break
+if __name__ == "__main__":
+    root = tk.Tk()
+    # Przekazujemy zainicjalizowany silnik do UI
+    app = TransportApp(root, app_engine)
+    root.mainloop()
