@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import random
 from collections import deque
 
@@ -34,6 +35,7 @@ class SimulationEngine:
         self._breakdowns_triggered = False
         self._breakdown_events: int = 0
         self._road_event_count: int = 0
+        self.profit_history: list[dict] = []
 
         self._init_vehicles()
         if config.scenario_logistics_center:
@@ -45,6 +47,7 @@ class SimulationEngine:
         if config.scenario_random_events:
             self.env.process(self._road_event_generator())
         self.env.process(self._dispatcher())
+        self.env.process(self._stats_recorder())
 
     @property
     def time(self) -> float:
@@ -797,6 +800,70 @@ class SimulationEngine:
             "hub_via_delivered": hub_via_delivered,
             "active_road_events": active_road_events,
             "road_events_total": self._road_event_count,
+        }
+
+    def _stats_recorder(self):
+        """Sample revenue/cost once per sim-hour for the profit time series."""
+        while True:
+            yield self.env.timeout(1.0)
+            if self.env.now > self.config.simulation_duration:
+                return
+            s = self.get_stats()
+            self.profit_history.append(
+                {
+                    "time": round(self.env.now, 2),
+                    "revenue": round(s["total_revenue"], 2),
+                    "cost": round(s["total_cost"], 2),
+                }
+            )
+
+    def export_data(self) -> dict:
+        """Return all simulation state as a JSON-serialisable dict."""
+        config_data = dataclasses.asdict(self.config)
+
+        orders_data = [
+            {
+                "id": o.id,
+                "source": o.source,
+                "destination": o.destination,
+                "weight_kg": round(o.weight, 2),
+                "created_at_h": round(o.created_at, 2),
+                "deadline_h": round(o.deadline, 2),
+                "penalty_rate": o.penalty_rate,
+                "revenue": round(o.revenue, 2),
+                "status": o.status.value,
+                "assigned_vehicle": o.assigned_vehicle,
+                "delivered_at_h": round(o.delivered_at, 2)
+                if o.delivered_at is not None
+                else None,
+                "via_hub": o.via_hub,
+                "delay_h": round(o.delay, 2),
+                "penalty": round(o.penalty, 2),
+                "net": round(o.revenue - o.penalty, 2),
+            }
+            for o in self.orders
+        ]
+
+        vehicles_data = [
+            {
+                "id": v.id,
+                "final_city": v.current_city,
+                "status": v.status.value,
+                "total_distance_km": round(v.total_distance_km, 2),
+                "total_fuel_cost": round(v.total_fuel_cost, 2),
+                "total_repair_cost": round(v.total_repair_cost, 2),
+                "deliveries": v.deliveries,
+            }
+            for v in self.vehicles
+        ]
+
+        return {
+            "config": config_data,
+            "summary": self.get_stats(),
+            "orders": orders_data,
+            "vehicles": vehicles_data,
+            "profit_history": self.profit_history,
+            "event_log": list(self.log_messages),
         }
 
     def log(self, msg: str):

@@ -1,4 +1,5 @@
 import tkinter as tk
+
 from config import SimConfig
 from ui import TransportApp
 
