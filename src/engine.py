@@ -521,11 +521,18 @@ class SimulationEngine:
         total_revenue = sum(o.revenue for o in delivered)
         total_fuel = sum(v.total_fuel_cost for v in self.vehicles)
         total_repair = sum(v.total_repair_cost for v in self.vehicles)
-        sum(1 for v in self.vehicles if v.status == VehicleStatus.MOVING)
-        sum(1 for v in self.vehicles if v.status == VehicleStatus.IDLE)
-        sum(1 for v in self.vehicles if v.status == VehicleStatus.BROKEN_DOWN)
-        sum(1 for v in self.vehicles if v.status == VehicleStatus.RESTING)
+        vehicles_moving = sum(
+            1 for v in self.vehicles if v.status == VehicleStatus.MOVING
+        )
+        vehicles_idle = sum(1 for v in self.vehicles if v.status == VehicleStatus.IDLE)
+        vehicles_broken = sum(
+            1 for v in self.vehicles if v.status == VehicleStatus.BROKEN_DOWN
+        )
+        vehicles_resting = sum(
+            1 for v in self.vehicles if v.status == VehicleStatus.RESTING
+        )
         pending = sum(1 for o in self.orders if o.status == OrderStatus.PENDING)
+        total_cost = total_fuel + total_penalty + total_repair
         return {
             "time": self.env.now,
             "total_orders": len(self.orders),
@@ -538,7 +545,12 @@ class SimulationEngine:
             "total_penalty": total_penalty,
             "total_fuel": total_fuel,
             "total_repair": total_repair,
-            "net_profit": total_revenue - total_penalty - total_fuel - total_repair,
+            "total_cost": total_cost,
+            "net_profit": total_revenue - total_cost,
+            "vehicles_moving": vehicles_moving,
+            "vehicles_idle": vehicles_idle,
+            "vehicles_resting": vehicles_resting,
+            "vehicles_broken": vehicles_broken,
         }
 
     def log(self, msg: str):
