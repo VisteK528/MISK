@@ -118,7 +118,7 @@ class SimulationEngine:
             self.config.order_deadline_min, self.config.order_deadline_max
         )
 
-        _, delivery_h = self.graph.dijkstra(src, dst, self.config.vehicle_speed)
+        _, delivery_h = self.graph.A_star(src, dst, self.config.vehicle_speed)
         delivery_km = delivery_h * self.config.vehicle_speed
         revenue = self.config.base_revenue + self.config.revenue_per_km * delivery_km
 
@@ -235,7 +235,7 @@ class SimulationEngine:
             for order in list(hub_orders):
                 if v.current_load + order.weight > v.capacity:
                     continue
-                seg, leg_h = self.graph.dijkstra(order.source, hub, v.speed)
+                seg, leg_h = self.graph.A_star(order.source, hub, v.speed)
                 if not seg:
                     continue
                 leg_km = leg_h * v.speed
@@ -279,7 +279,7 @@ class SimulationEngine:
         for wp in waypoints:
             if wp.city == current:
                 continue
-            seg, _ = self.graph.dijkstra(current, wp.city, self.config.vehicle_speed)
+            seg, _ = self.graph.A_star(current, wp.city, self.config.vehicle_speed)
             if not seg:
                 return []
             route.extend(seg[1:])
@@ -298,7 +298,7 @@ class SimulationEngine:
         t = self.env.now
         for wp in waypoints:
             if wp.city != current:
-                _, seg_h = self.graph.dijkstra(current, wp.city, speed)
+                _, seg_h = self.graph.A_star(current, wp.city, speed)
                 t += seg_h
                 current = wp.city
             if wp.action == "delivery" and wp.order_id == order_id:
@@ -725,7 +725,7 @@ class SimulationEngine:
             for order in list(hub_orders):
                 if v.current_load + order.weight > v.capacity:
                     continue
-                seg, _ = self.graph.dijkstra(hub, order.destination, v.speed)
+                seg, _ = self.graph.A_star(hub, order.destination, v.speed)
                 if not seg:
                     continue
                 order.status = OrderStatus.ASSIGNED
