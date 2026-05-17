@@ -32,7 +32,7 @@ class SimulationEngine:
         self.log_messages: deque[str] = deque(maxlen=500)
 
         self._order_counter = 0
-        self._breakdowns_triggered = False
+
         self._breakdown_events: int = 0
         self._road_event_count: int = 0
         self.profit_history: list[dict] = []
@@ -90,6 +90,10 @@ class SimulationEngine:
         if target > self.config.simulation_duration:
             target = self.config.simulation_duration
         self.env.run(until=target)
+
+    def run_to_end(self):
+        """Run simulation to completion in one shot (headless mode)."""
+        self.env.run(until=self.config.simulation_duration)
 
     # ------------------------------------------------------------------
     # Order generation
@@ -554,24 +558,37 @@ class SimulationEngine:
     # ------------------------------------------------------------------
 
     def _breakdown_process(self):
-        """Wait until trigger time, then break down K vehicles."""
+        """Schedule breakdown_k individual breakdowns spread over the simulation."""
         yield self.env.timeout(self.config.breakdown_trigger_time)
-        if self._breakdowns_triggered:
+
+        k = self.config.breakdown_k
+        t_start = self.env.now
+        t_end = self.config.simulation_duration
+        if k <= 0 or t_end <= t_start:
             return
-        self._breakdowns_triggered = True
 
-        candidates = [v for v in self.vehicles if v.status == VehicleStatus.MOVING]
-        if not candidates:
-            candidates = [
-                v for v in self.vehicles if v.status != VehicleStatus.BROKEN_DOWN
-            ]
+        times = sorted(self.rng.uniform(t_start, t_end) for _ in range(k))
+        for t in times:
+            wait = t - self.env.now
+            if wait > 0:
+                yield self.env.timeout(wait)
+            if self.env.now >= t_end:
+                return
 
-        k = min(self.config.breakdown_k, len(candidates))
-        broken = self.rng.sample(candidates, k)
-        self.log(
-            f"=== BREAKDOWN EVENT: {k} vehicle(s) fail at t={self.env.now:.1f}h ==="
-        )
-        for v in broken:
+            candidates = [v for v in self.vehicles if v.status == VehicleStatus.MOVING]
+            if not candidates:
+                candidates = [
+                    v for v in self.vehicles if v.status != VehicleStatus.BROKEN_DOWN
+                ]
+            if not candidates:
+                continue
+
+            v = self.rng.choice(candidates)
+            n = self._breakdown_events + 1
+            self.log(
+                f"=== BREAKDOWN {n}/{k}: "
+                f"Vehicle {v.id} at t={self.env.now:.1f}h ==="
+            )
             self._apply_breakdown(v)
 
     def _apply_breakdown(self, v: Vehicle):
