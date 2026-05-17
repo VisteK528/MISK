@@ -22,7 +22,7 @@ class SimulationEngine:
     def __init__(self, config: SimConfig):
         self.config = config
         self.graph = CityGraph()
-        self.rng = random.Random(42)
+        self.rng = random.Random(config.seed)
 
         self.env = simpy.Environment()
 
@@ -32,6 +32,8 @@ class SimulationEngine:
 
         self._order_counter = 0
         self._breakdowns_triggered = False
+        self._breakdown_events: int = 0
+        self._road_event_count: int = 0
 
         self._init_vehicles()
         if config.scenario_logistics_center:
@@ -67,8 +69,13 @@ class SimulationEngine:
             self.vehicles.append(v)
 
     def _init_logistics_center(self):
-        # TODO implement logistics center
-        pass
+        hub = self.config.hub_city
+        if hub not in self.graph.cities:
+            raise ValueError(f"Hub city '{hub}' not found in graph")
+        self.log(
+            f"Centrum logistyczne otwarte w {hub} "
+            f"(~{self.config.hub_via_rate * 100:.0f}% zlecen przez hub)"
+        )
 
     # ------------------------------------------------------------------
     # Simulation control
@@ -108,6 +115,14 @@ class SimulationEngine:
         delivery_km = delivery_h * self.config.vehicle_speed
         revenue = self.config.base_revenue + self.config.revenue_per_km * delivery_km
 
+        hub = self.config.hub_city
+        via_hub = (
+            self.config.scenario_logistics_center
+            and src != hub
+            and dst != hub
+            and self.rng.random() < self.config.hub_via_rate
+        )
+
         order = Order(
             id=self._order_counter,
             source=src,
@@ -117,6 +132,7 @@ class SimulationEngine:
             penalty_rate=self.config.penalty_per_hour,
             created_at=self.env.now,
             revenue=revenue,
+            via_hub=via_hub,
         )
         self.orders.append(order)
         self._order_counter += 1
@@ -152,6 +168,9 @@ class SimulationEngine:
         if not pending:
             return
 
+        direct = [o for o in pending if not o.via_hub]
+        hub_leg1 = [o for o in pending if o.via_hub]
+
         idle_vehicles = [
             v
             for v in self.vehicles
@@ -159,15 +178,15 @@ class SimulationEngine:
         ]
 
         for v in idle_vehicles:
-            if not pending:
+            if not direct:
                 break
             # Keep adding orders to this vehicle while it's profitable
-            while pending:
+            while direct:
                 best_profit = 0.0  # only accept positive-profit additions
                 best_order: Order | None = None
                 best_wps: list[Waypoint] = []
 
-                for order in pending:
+                for order in direct:
                     profit, new_wps = self._cheapest_insertion(v, order)
                     if profit > best_profit:
                         best_profit = profit
@@ -177,7 +196,7 @@ class SimulationEngine:
                 if best_order is None:
                     break  # nothing profitable to add
 
-                pending.remove(best_order)
+                direct.remove(best_order)
                 best_order.status = OrderStatus.ASSIGNED
                 best_order.assigned_vehicle = v.id
                 v.order_ids.append(best_order.id)
@@ -191,6 +210,45 @@ class SimulationEngine:
 
             if v.order_ids:
                 self._launch_vehicle(v)
+
+        if hub_leg1:
+            self._assign_hub_leg1_orders(hub_leg1)
+
+    def _assign_hub_leg1_orders(self, hub_orders: list[Order]):
+        """Assign the source → hub leg for via_hub orders to idle vehicles."""
+        hub = self.config.hub_city
+        idle_vehicles = [
+            v
+            for v in self.vehicles
+            if v.status == VehicleStatus.IDLE and not v.order_ids
+        ]
+        for v in idle_vehicles:
+            if not hub_orders:
+                break
+            for order in list(hub_orders):
+                if v.current_load + order.weight > v.capacity:
+                    continue
+                seg, leg_h = self.graph.dijkstra(order.source, hub, v.speed)
+                if not seg:
+                    continue
+                leg_km = leg_h * v.speed
+                if order.revenue / 2 < leg_km * v.fuel_cost_per_km:
+                    continue  # leg 1 alone not worth it
+                order.status = OrderStatus.ASSIGNED
+                order.assigned_vehicle = v.id
+                v.order_ids.append(order.id)
+                v.current_load += order.weight
+                v.waypoints = [
+                    Waypoint(order.source, order.id, "pickup"),
+                    Waypoint(hub, order.id, "delivery"),
+                ]
+                hub_orders.remove(order)
+                self.log(
+                    f"Hub leg-1: order #{order.id} ({order.source}→{hub}) "
+                    f"assigned to vehicle {v.id}"
+                )
+                self._launch_vehicle(v)
+                break
 
     # ------------------------------------------------------------------
     # Route helpers
@@ -326,8 +384,16 @@ class SimulationEngine:
 
         while v.route_index < len(v.route) - 1:
             if v.status == VehicleStatus.BROKEN_DOWN:
-                pass
-                # TODO implement broken-down behaviour (Scenario 2)
+                wait = max(0.0, v.repair_until - self.env.now)
+                if wait > 0:
+                    yield self.env.timeout(wait)
+                if v.breakdown_type == "out_of_service":
+                    v.status = VehicleStatus.IDLE
+                    v.breakdown_type = None
+                    return
+                v.status = VehicleStatus.MOVING
+                v.breakdown_type = None
+                self.log(f"Vehicle {v.id} repaired, resuming at {v.current_city}")
 
             ca = v.route[v.route_index]
             cb = v.route[v.route_index + 1]
@@ -398,7 +464,21 @@ class SimulationEngine:
                     self.log(f"Vehicle {v.id} picked up #{order.id} at {city}")
 
             else:  # delivery
-                if order.status in (OrderStatus.IN_TRANSIT, OrderStatus.ASSIGNED):
+                if (
+                    order.via_hub
+                    and order.status == OrderStatus.IN_TRANSIT
+                    and city == self.config.hub_city
+                ):
+                    # First leg complete – cargo now waiting at hub
+                    order.status = OrderStatus.AT_HUB
+                    v.current_load = max(0.0, v.current_load - order.weight)
+                    if order.id in v.order_ids:
+                        v.order_ids.remove(order.id)
+                    self.log(
+                        f"Vehicle {v.id} dropped #{order.id} at hub ({city}), "
+                        f"awaiting onward transport"
+                    )
+                elif order.status in (OrderStatus.IN_TRANSIT, OrderStatus.ASSIGNED):
                     order.status = OrderStatus.DELIVERED
                     order.delivered_at = self.env.now
                     v.deliveries += 1
@@ -477,20 +557,172 @@ class SimulationEngine:
             return
         self._breakdowns_triggered = True
 
-        # TODO add breakdowns (Scenario 2)
+        candidates = [v for v in self.vehicles if v.status == VehicleStatus.MOVING]
+        if not candidates:
+            candidates = [
+                v for v in self.vehicles if v.status != VehicleStatus.BROKEN_DOWN
+            ]
+
+        k = min(self.config.breakdown_k, len(candidates))
+        broken = self.rng.sample(candidates, k)
+        self.log(
+            f"=== BREAKDOWN EVENT: {k} vehicle(s) fail at t={self.env.now:.1f}h ==="
+        )
+        for v in broken:
+            self._apply_breakdown(v)
+
+    def _apply_breakdown(self, v: Vehicle):
+        r = self.rng.random()
+        driver_p = self.config.repair_driver_prob
+        mobile_p = self.config.repair_mobile_prob
+        if r < driver_p:
+            v.breakdown_type = "driver"
+            repair_time = self.config.repair_driver_delay
+            self.log(
+                f"Vehicle {v.id} broke down at {v.current_city} – "
+                f"driver self-repair ({repair_time:.0f}h delay)"
+            )
+        elif r < driver_p + mobile_p:
+            v.breakdown_type = "mobile"
+            repair_time = self.config.mobile_service_delay
+            v.total_repair_cost += self.config.mobile_service_cost
+            self.log(
+                f"Vehicle {v.id} broke down – mobile service called "
+                f"(€{self.config.mobile_service_cost:.0f}, {repair_time:.0f}h delay)"
+            )
+        else:
+            v.breakdown_type = "out_of_service"
+            repair_time = self.config.out_of_service_duration
+            v.total_repair_cost += self.config.out_of_service_cost
+            self.log(
+                f"Vehicle {v.id} out of service for "
+                f"{self.config.out_of_service_duration / 24:.0f} days "
+                f"(€{self.config.out_of_service_cost:.0f}) – orders redistributed"
+            )
+            self._return_orders_to_pending(v)
+
+        v.status = VehicleStatus.BROKEN_DOWN
+        v.repair_until = self.env.now + repair_time
+        self._breakdown_events += 1
+
+    def _return_orders_to_pending(self, v: Vehicle):
+        """Return undelivered orders to pending so the dispatcher can reassign them."""
+        for oid in list(v.order_ids):
+            order = self.orders[oid]
+            if order.status not in (OrderStatus.DELIVERED,):
+                order.status = OrderStatus.PENDING
+                order.assigned_vehicle = None
+                self.log(
+                    f"Order #{oid} returned to pending (vehicle {v.id} out of service)"
+                )
+        v.order_ids.clear()
+        v.waypoints.clear()
+        v.route.clear()
+        v.route_index = 0
+        v.current_load = 0.0
 
     def _road_event_generator(self):
         """Periodically create random road events."""
         while True:
-            yield self.env.timeout(1.0)
+            interval = self.rng.expovariate(1.0 / self.config.event_interval_mean)
+            yield self.env.timeout(interval)
             if self.env.now >= self.config.simulation_duration:
                 return
+            self._trigger_road_event()
 
-            # TODO implement road event generator (Scenario 4)
+    def _trigger_road_event(self):
+        edges = list(self.graph.get_all_road_keys())
+        c1, c2 = self.rng.choice(edges)
+
+        r = self.rng.random()
+        # weights: weather 50%, accident 30%, closure 20%
+        if r < 0.50:
+            event_type = "weather"
+            mult = self.rng.uniform(
+                self.config.event_weather_mult * 0.8,
+                self.config.event_weather_mult * 1.2,
+            )
+            duration = self.rng.expovariate(
+                1.0 / self.config.event_weather_duration_mean
+            )
+        elif r < 0.80:
+            event_type = "accident"
+            mult = self.rng.uniform(
+                self.config.event_accident_mult * 0.8,
+                self.config.event_accident_mult * 1.2,
+            )
+            duration = self.rng.expovariate(
+                1.0 / self.config.event_accident_duration_mean
+            )
+        else:
+            event_type = "closure"
+            mult = 100.0
+            duration = self.rng.expovariate(
+                1.0 / self.config.event_closure_duration_mean
+            )
+
+        self._road_event_count += 1
+        self.graph.set_multiplier(c1, c2, mult)
+        self.log(
+            f"Road event [{event_type}] {c1}–{c2}: "
+            f"{'BLOCKED' if mult >= 100 else f'x{mult:.1f} slower'} "
+            f"for ~{duration:.0f}h"
+        )
+
+        # Reroute any vehicle currently on this segment
+        for v in self.vehicles:
+            if v.status == VehicleStatus.MOVING and v.route_index < len(v.route) - 1:
+                ca = v.route[v.route_index]
+                cb = v.route[v.route_index + 1]
+                if tuple(sorted([ca, cb])) == tuple(sorted([c1, c2])):
+                    self._reroute_vehicle(v)
+
+        self.env.process(self._restore_road(c1, c2, duration))
+
+    def _restore_road(self, c1: str, c2: str, duration: float):
+        yield self.env.timeout(duration)
+        self.graph.set_multiplier(c1, c2, 1.0)
+        self.log(f"Road cleared: {c1}–{c2}")
 
     def _process_hub_orders(self):
-        # TODO implement logistics hub order processing (Scenario 3)
-        pass
+        """Assign hub→destination (leg 2) for orders waiting at the logistics center."""
+        hub = self.config.hub_city
+        hub_orders = [o for o in self.orders if o.status == OrderStatus.AT_HUB]
+        if not hub_orders:
+            return
+
+        idle_at_hub = [
+            v
+            for v in self.vehicles
+            if v.status == VehicleStatus.IDLE
+            and v.current_city == hub
+            and not v.order_ids
+        ]
+
+        for v in idle_at_hub:
+            if not hub_orders:
+                break
+            for order in list(hub_orders):
+                if v.current_load + order.weight > v.capacity:
+                    continue
+                seg, _ = self.graph.dijkstra(hub, order.destination, v.speed)
+                if not seg:
+                    continue
+                order.status = OrderStatus.ASSIGNED
+                order.assigned_vehicle = v.id
+                v.order_ids.append(order.id)
+                v.current_load += order.weight
+                v.waypoints = [
+                    Waypoint(hub, order.id, "pickup"),
+                    Waypoint(order.destination, order.id, "delivery"),
+                ]
+                hub_orders.remove(order)
+                self.log(
+                    f"Hub leg-2: order #{order.id} ({hub}→{order.destination}) "
+                    f"assigned to vehicle {v.id}"
+                )
+                self._launch_vehicle(v)
+                break
 
     # ------------------------------------------------------------------
     # UI helpers
@@ -533,6 +765,15 @@ class SimulationEngine:
         )
         pending = sum(1 for o in self.orders if o.status == OrderStatus.PENDING)
         total_cost = total_fuel + total_penalty + total_repair
+        hub_at_hub = sum(1 for o in self.orders if o.status == OrderStatus.AT_HUB)
+        hub_via_delivered = sum(
+            1 for o in self.orders if o.status == OrderStatus.DELIVERED and o.via_hub
+        )
+        active_road_events = sum(
+            1
+            for (c1, c2) in self.graph.get_all_road_keys()
+            if self.graph.get_multiplier(c1, c2) > 1.0
+        )
         return {
             "time": self.env.now,
             "total_orders": len(self.orders),
@@ -551,6 +792,11 @@ class SimulationEngine:
             "vehicles_idle": vehicles_idle,
             "vehicles_resting": vehicles_resting,
             "vehicles_broken": vehicles_broken,
+            "breakdown_events": self._breakdown_events,
+            "hub_at_hub": hub_at_hub,
+            "hub_via_delivered": hub_via_delivered,
+            "active_road_events": active_road_events,
+            "road_events_total": self._road_event_count,
         }
 
     def log(self, msg: str):
