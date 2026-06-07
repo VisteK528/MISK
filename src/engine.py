@@ -118,8 +118,7 @@ class SimulationEngine:
             self.config.order_deadline_min, self.config.order_deadline_max
         )
 
-        _, delivery_h = self.graph.A_star(src, dst, self.config.vehicle_speed)
-        delivery_km = delivery_h * self.config.vehicle_speed
+        delivery_km = self.graph.base_distance(src, dst)
         revenue = self.config.base_revenue + self.config.revenue_per_km * delivery_km
 
         hub = self.config.hub_city
@@ -129,6 +128,13 @@ class SimulationEngine:
             and dst != hub
             and self.rng.random() < self.config.hub_via_rate
         )
+        if via_hub:
+            direct_km = self.graph.base_distance(src, dst)
+            hub_km = self.graph.base_distance(src, hub) + self.graph.base_distance(
+                hub, dst
+            )
+            if direct_km <= 0 or hub_km > self.config.hub_detour_max * direct_km:
+                via_hub = False
 
         order = Order(
             id=self._order_counter,
@@ -140,6 +146,7 @@ class SimulationEngine:
             created_at=self.env.now,
             revenue=revenue,
             via_hub=via_hub,
+            dropoff_city=hub if via_hub else None,
         )
         self.orders.append(order)
         self._order_counter += 1
@@ -159,8 +166,6 @@ class SimulationEngine:
             if self.env.now >= self.config.simulation_duration:
                 return
             self._assign_pending_orders()
-            if self.config.scenario_logistics_center:
-                self._process_hub_orders()
 
     def _assign_pending_orders(self):
         """
@@ -171,12 +176,13 @@ class SimulationEngine:
         scored simultaneously so the globally best (vehicle, order) pair is
         always chosen first.
         """
-        pending = [o for o in self.orders if o.status == OrderStatus.PENDING]
-        if not pending:
+        candidates = [
+            o
+            for o in self.orders
+            if o.status in (OrderStatus.PENDING, OrderStatus.AT_HUB)
+        ]
+        if not candidates:
             return
-
-        direct = [o for o in pending if not o.via_hub]
-        hub_leg1 = [o for o in pending if o.via_hub]
 
         idle_vehicles = [
             v
@@ -185,15 +191,14 @@ class SimulationEngine:
         ]
 
         for v in idle_vehicles:
-            if not direct:
+            if not candidates:
                 break
-            # Keep adding orders to this vehicle while it's profitable
-            while direct:
+            while candidates:
                 best_profit = 0.0  # only accept positive-profit additions
                 best_order: Order | None = None
                 best_wps: list[Waypoint] = []
 
-                for order in direct:
+                for order in candidates:
                     profit, new_wps = self._cheapest_insertion(v, order)
                     if profit > best_profit:
                         best_profit = profit
@@ -203,7 +208,7 @@ class SimulationEngine:
                 if best_order is None:
                     break  # nothing profitable to add
 
-                direct.remove(best_order)
+                candidates.remove(best_order)
                 best_order.status = OrderStatus.ASSIGNED
                 best_order.assigned_vehicle = v.id
                 v.order_ids.append(best_order.id)
@@ -211,51 +216,12 @@ class SimulationEngine:
                 v.waypoints = best_wps
                 self.log(
                     f"Queued order #{best_order.id} "
-                    f"({best_order.source}→{best_order.destination}) "
+                    f"({best_order.pickup}→{best_order.dropoff}) "
                     f"for vehicle {v.id}  profit €{best_profit:.0f}"
                 )
 
             if v.order_ids:
                 self._launch_vehicle(v)
-
-        if hub_leg1:
-            self._assign_hub_leg1_orders(hub_leg1)
-
-    def _assign_hub_leg1_orders(self, hub_orders: list[Order]):
-        """Assign the source → hub leg for via_hub orders to idle vehicles."""
-        hub = self.config.hub_city
-        idle_vehicles = [
-            v
-            for v in self.vehicles
-            if v.status == VehicleStatus.IDLE and not v.order_ids
-        ]
-        for v in idle_vehicles:
-            if not hub_orders:
-                break
-            for order in list(hub_orders):
-                if v.current_load + order.weight > v.capacity:
-                    continue
-                seg, leg_h = self.graph.A_star(order.source, hub, v.speed)
-                if not seg:
-                    continue
-                leg_km = leg_h * v.speed
-                if order.revenue / 2 < leg_km * v.fuel_cost_per_km:
-                    continue  # leg 1 alone not worth it
-                order.status = OrderStatus.ASSIGNED
-                order.assigned_vehicle = v.id
-                v.order_ids.append(order.id)
-                v.current_load += order.weight
-                v.waypoints = [
-                    Waypoint(order.source, order.id, "pickup"),
-                    Waypoint(hub, order.id, "delivery"),
-                ]
-                hub_orders.remove(order)
-                self.log(
-                    f"Hub leg-1: order #{order.id} ({order.source}→{hub}) "
-                    f"assigned to vehicle {v.id}"
-                )
-                self._launch_vehicle(v)
-                break
 
     # ------------------------------------------------------------------
     # Route helpers
@@ -329,8 +295,8 @@ class SimulationEngine:
         best_profit = float("-inf")
         best_wps: list[Waypoint] = []
 
-        pickup_wp = Waypoint(order.source, order.id, "pickup")
-        delivery_wp = Waypoint(order.destination, order.id, "delivery")
+        pickup_wp = Waypoint(order.pickup, order.id, "pickup")
+        delivery_wp = Waypoint(order.dropoff, order.id, "delivery")
 
         for i in range(n + 1):  # insertion index for pickup
             for j in range(i, n + 1):  # insertion index for delivery (>= pickup)
@@ -473,17 +439,20 @@ class SimulationEngine:
             else:  # delivery
                 if (
                     order.via_hub
-                    and order.status == OrderStatus.IN_TRANSIT
+                    and order.dropoff == self.config.hub_city
+                    and order.status in (OrderStatus.IN_TRANSIT, OrderStatus.ASSIGNED)
                     and city == self.config.hub_city
                 ):
-                    # First leg complete – cargo now waiting at hub
                     order.status = OrderStatus.AT_HUB
+                    order.assigned_vehicle = None
+                    order.pickup_city = self.config.hub_city
+                    order.dropoff_city = order.destination
                     v.current_load = max(0.0, v.current_load - order.weight)
                     if order.id in v.order_ids:
                         v.order_ids.remove(order.id)
                     self.log(
                         f"Vehicle {v.id} dropped #{order.id} at hub ({city}), "
-                        f"awaiting onward transport"
+                        f"awaiting consolidated onward transport"
                     )
                 elif order.status in (OrderStatus.IN_TRANSIT, OrderStatus.ASSIGNED):
                     order.status = OrderStatus.DELIVERED
@@ -508,7 +477,16 @@ class SimulationEngine:
         # Deliver any orders that somehow weren't delivered mid-route
         for oid in list(v.order_ids):
             o = self.orders[oid]
-            if o.status in (OrderStatus.IN_TRANSIT, OrderStatus.ASSIGNED):
+            if (
+                o.via_hub
+                and o.dropoff == self.config.hub_city
+                and o.status in (OrderStatus.IN_TRANSIT, OrderStatus.ASSIGNED)
+            ):
+                o.status = OrderStatus.AT_HUB
+                o.assigned_vehicle = None
+                o.pickup_city = self.config.hub_city
+                o.dropoff_city = o.destination
+            elif o.status in (OrderStatus.IN_TRANSIT, OrderStatus.ASSIGNED):
                 o.status = OrderStatus.DELIVERED
                 o.delivered_at = self.env.now
                 v.deliveries += 1
@@ -586,8 +564,7 @@ class SimulationEngine:
             v = self.rng.choice(candidates)
             n = self._breakdown_events + 1
             self.log(
-                f"=== BREAKDOWN {n}/{k}: "
-                f"Vehicle {v.id} at t={self.env.now:.1f}h ==="
+                f"=== BREAKDOWN {n}/{k}: Vehicle {v.id} at t={self.env.now:.1f}h ==="
             )
             self._apply_breakdown(v)
 
@@ -703,46 +680,6 @@ class SimulationEngine:
         yield self.env.timeout(duration)
         self.graph.set_multiplier(c1, c2, 1.0)
         self.log(f"Road cleared: {c1}–{c2}")
-
-    def _process_hub_orders(self):
-        """Assign hub→destination (leg 2) for orders waiting at the logistics center."""
-        hub = self.config.hub_city
-        hub_orders = [o for o in self.orders if o.status == OrderStatus.AT_HUB]
-        if not hub_orders:
-            return
-
-        idle_at_hub = [
-            v
-            for v in self.vehicles
-            if v.status == VehicleStatus.IDLE
-            and v.current_city == hub
-            and not v.order_ids
-        ]
-
-        for v in idle_at_hub:
-            if not hub_orders:
-                break
-            for order in list(hub_orders):
-                if v.current_load + order.weight > v.capacity:
-                    continue
-                seg, _ = self.graph.A_star(hub, order.destination, v.speed)
-                if not seg:
-                    continue
-                order.status = OrderStatus.ASSIGNED
-                order.assigned_vehicle = v.id
-                v.order_ids.append(order.id)
-                v.current_load += order.weight
-                v.waypoints = [
-                    Waypoint(hub, order.id, "pickup"),
-                    Waypoint(order.destination, order.id, "delivery"),
-                ]
-                hub_orders.remove(order)
-                self.log(
-                    f"Hub leg-2: order #{order.id} ({hub}→{order.destination}) "
-                    f"assigned to vehicle {v.id}"
-                )
-                self._launch_vehicle(v)
-                break
 
     # ------------------------------------------------------------------
     # UI helpers

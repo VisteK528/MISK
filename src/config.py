@@ -7,7 +7,7 @@ class SimConfig:
     num_vehicles: int = 8
     vehicle_capacity: float = 20_000  # kg
     vehicle_speed: float = 80  # km/h average
-    fuel_cost_per_km: float = 1.5  # EUR/km
+    fuel_cost_per_km: float = 0.5  # EUR/km
     max_driver_hours: float = 10  # hours before mandatory rest
     rest_duration: float = 9  # hours of rest
     double_crew: bool = False  # two drivers – no rest needed
@@ -45,7 +45,8 @@ class SimConfig:
 
     # Scenario 3 – logistics center (hub)
     hub_city: str = "Frankfurt"
-    hub_via_rate: float = 0.3  # fraction of new orders routed via hub
+    hub_via_rate: float = 0.3  # fraction of eligible orders routed via hub
+    hub_detour_max: float = 1.4  # route via hub only if src→hub→dst ≤ this × direct
 
     # Scenario 4 – random road events
     event_interval_mean: float = 12.0  # mean hours between events

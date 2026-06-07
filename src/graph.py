@@ -134,6 +134,11 @@ class CityGraph:
         """Return set of sorted (city_a, city_b) tuples for every edge."""
         return {tuple(sorted(e)) for e in self.G.edges()}
 
+    def base_distance(self, start: str, end: str) -> float:
+        if start == end:
+            return 0.0
+        return nx.shortest_path_length(self.G, start, end, weight="distance_km")
+
     def A_star(self, start: str, end: str, speed: float):
         def heuristic(u, v):
             nu, nv = self.G.nodes[u], self.G.nodes[v]

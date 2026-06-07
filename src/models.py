@@ -42,6 +42,17 @@ class Order:
     delivered_at: Optional[float] = None
     via_hub: bool = False
 
+    pickup_city: Optional[str] = None
+    dropoff_city: Optional[str] = None
+
+    @property
+    def pickup(self) -> str:
+        return self.pickup_city or self.source
+
+    @property
+    def dropoff(self) -> str:
+        return self.dropoff_city or self.destination
+
     @property
     def delay(self) -> float:
         if self.delivered_at is not None and self.delivered_at > self.deadline:
