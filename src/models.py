@@ -82,3 +82,6 @@ class Vehicle:
     total_fuel_cost: float = 0.0
     total_repair_cost: float = 0.0
     deliveries: int = 0
+
+    breakdown_type: Optional[str] = None  # "driver" | "mobile" | "out_of_service"
+    repair_until: float = 0.0  # sim-time when repair completes
